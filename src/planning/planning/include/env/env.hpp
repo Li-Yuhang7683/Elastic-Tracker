@@ -643,6 +643,152 @@ class Env {
     return ret;
   }
 
+  // ============================================================
+  // NOTE No-A* visibility waypoint selector
+  //
+  // 只负责回答：
+  //   “为了观察 target，我应该站在哪个位置？”
+  //
+  // 不负责回答：
+  //   “从当前位置应该怎么走过去？”
+  //
+  // 路径搜索完全交给 Kinodynamic A*。
+  // ============================================================
+  inline bool selectVisibleWaypoint(const Eigen::Vector3d& reference,
+                                    const Eigen::Vector3d& target,
+                                    Eigen::Vector3d& waypoint) const {
+    if (desired_dist_ <= 1e-3) {
+      ROS_ERROR("[visibility selector] invalid desired tracking distance.");
+      return false;
+    }
+
+    // target 必须位于当前地图中。
+    if (!mapPtr_->isInMap(target)) {
+      ROS_WARN("[visibility selector] target is outside current map.");
+      return false;
+    }
+
+    // 按地图分辨率决定圆周采样密度。
+    // 与 visible_pair() 的角度分辨率保持同一量级。
+    double d_theta =
+        mapPtr_->resolution / desired_dist_ / 2.0;
+
+    if (d_theta <= 1e-4) {
+      d_theta = 0.01;
+    }
+
+    int sample_num =
+        static_cast<int>(std::ceil(2.0 * M_PI / d_theta));
+
+    // 防止采样过稀或过密。
+    if (sample_num < 72) {
+      sample_num = 72;
+    }
+    if (sample_num > 720) {
+      sample_num = 720;
+    }
+
+    bool found = false;
+    double best_score =
+        std::numeric_limits<double>::max();
+
+    Eigen::Vector3d best_point =
+        Eigen::Vector3d::Zero();
+
+    for (int i = 0; i < sample_num; ++i) {
+      const double theta =
+          2.0 * M_PI *
+          static_cast<double>(i) /
+          static_cast<double>(sample_num);
+
+      // observation waypoint 位于 target 周围 tracking circle 上。
+      // 原 findVisiblePath() 的 heuristic 同样主要约束 XY 平面距离，
+      // 因此这里保持 target 的高度不变。
+      Eigen::Vector3d candidate = target;
+      candidate.x() += desired_dist_ * std::cos(theta);
+      candidate.y() += desired_dist_ * std::sin(theta);
+
+      // 候选观察点必须位于地图内且不能在障碍物中。
+      if (!mapPtr_->isInMap(candidate) ||
+          mapPtr_->isOccupied(candidate)) {
+        continue;
+      }
+
+      // observation waypoint -> target 必须具有无遮挡视线。
+      if (!checkRayValid(candidate, target)) {
+        continue;
+      }
+
+      // 在所有合法 observation waypoint 中，
+      // 优先选择距离 reference 最近的点。
+      //
+      // 第一个 target：reference = 当前无人机位置；
+      // 后续 target：reference = 上一个 observation waypoint。
+      //
+      // 这样可以让 waypoint 序列尽量连续，但不在这里做路径搜索。
+      const double score =
+          (candidate - reference).squaredNorm();
+
+      if (score < best_score) {
+        best_score = score;
+        best_point = candidate;
+        found = true;
+      }
+    }
+
+    if (!found) {
+      ROS_WARN("[visibility selector] no valid observation waypoint found.");
+      return false;
+    }
+
+    waypoint = best_point;
+    return true;
+  }
+
+  // ============================================================
+  // 根据整段 target prediction 生成 observation waypoint 序列。
+  //
+  // 与原 findVisiblePath(start_p, targets, way_pts, path) 的区别：
+  //
+  // 原函数：
+  //   visibility waypoint selection + 6-connected A*
+  //
+  // 新函数：
+  //   visibility waypoint selection ONLY
+  //
+  // 不产生 path，不调用 A*。
+  // ============================================================
+  inline bool selectVisibleWaypoints(
+      const Eigen::Vector3d& start_p,
+      const std::vector<Eigen::Vector3d>& targets,
+      std::vector<Eigen::Vector3d>& way_pts) const {
+    way_pts.clear();
+
+    if (targets.empty()) {
+      ROS_WARN("[visibility selector] empty target prediction.");
+      return false;
+    }
+
+    Eigen::Vector3d reference = start_p;
+
+    for (const auto& target : targets) {
+      Eigen::Vector3d waypoint;
+
+      if (!selectVisibleWaypoint(
+              reference,
+              target,
+              waypoint)) {
+        way_pts.clear();
+        return false;
+      }
+
+      way_pts.push_back(waypoint);
+      reference = waypoint;
+    }
+
+    return !way_pts.empty();
+  }
+
   inline void visible_pair(const Eigen::Vector3d& center,
                            Eigen::Vector3d& seed,
                            Eigen::Vector3d& visible_p,
