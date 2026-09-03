@@ -29,6 +29,15 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
 )
 
+# Kinodynamic A* migrated from Fast-Planner
+add_library(kino_astar
+  src/kinodynamic_astar.cpp
+)
+
+target_link_libraries(kino_astar
+  ${catkin_LIBRARIES}
+)
+
 # planning node
 add_library(${PROJECT_NAME}_nodelet
 src/${PROJECT_NAME}_nodelet.cpp
