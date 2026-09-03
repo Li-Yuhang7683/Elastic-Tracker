@@ -781,7 +781,7 @@ void KinodynamicAstar::getSamples(double& ts, vector<Eigen::Vector3d>& point_set
 std::vector<PathNodePtr> KinodynamicAstar::getVisitedNodes()
 {
   vector<PathNodePtr> visited;
-  visited.assign(path_node_pool_.begin(), path_node_pool_.begin() + use_node_num_ - 1);
+  visited.assign(path_node_pool_.begin(), path_node_pool_.begin() + use_node_num_);
   return visited;
 }
 

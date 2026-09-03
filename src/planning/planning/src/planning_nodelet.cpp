@@ -328,107 +328,204 @@ class Nodelet : public nodelet::Nodelet {
     // ============================================================
     // Kinodynamic A* 旁路测试
     //
-    // 当前只测试 Kinodynamic A* 是否能够在 Elastic Tracker
-    // 的地图上正常搜索。
-    // 不修改原 path，不参与 SFC，也不参与 MINCO。
+    // 目的：
+    //   1. 不影响 Elastic Tracker 原始 A* -> SFC -> MINCO 流程。
+    //   2. 从原 Elastic A* 已生成的 path 中选择一个足够远的安全点。
+    //   3. 使用 L∞ 距离判断目标是否足够远，避免起点直接触发 near_end。
+    //   4. 运行 Kinodynamic A*，并在 RViz 中显示 Kino A* 路径。
+    //   5. 输出搜索节点数量，用于判断是否真正发生 motion primitive 扩展。
     // ============================================================
     if (generate_new_traj_success &&
         !land_triger_received_ &&
         kinoAstarInitialized_ &&
         !kinoAstarTestDone_ &&
-        !way_pts.empty())
+        !path.empty())
     {
-      // 起点状态直接使用 Elastic Tracker 当前规划初始状态
+      // ----------------------------------------------------------
+      // 1. 起始状态
+      // ----------------------------------------------------------
       const Eigen::Vector3d kino_start_pos = iniState.col(0);
       const Eigen::Vector3d kino_start_vel = iniState.col(1);
       const Eigen::Vector3d kino_start_acc = iniState.col(2);
 
-      // 使用原 findVisiblePath 找到的第一个合法可见点
-      // 作为 Kino A* 的测试目标
-      const Eigen::Vector3d kino_goal_pos = way_pts.front();
+      // ----------------------------------------------------------
+      // 2. 从原 Elastic A* 的 path 中选择 L∞ 距离最大的点
+      //
+      // Fast-Planner 当前 near_end 判断大致是：
+      //
+      //   |dx| <= 1 m
+      //   |dy| <= 1 m
+      //   |dz| <= 1 m
+      //
+      // 因此不能只看欧氏距离。
+      // 这里使用：
+      //
+      //   L∞ = max(|dx|, |dy|, |dz|)
+      //
+      // 来选择测试目标。
+      // ----------------------------------------------------------
+      size_t farthest_idx = 0;
+      double farthest_linf_dist = -1.0;
+      double farthest_euclidean_dist = -1.0;
 
-      // 第一次测试暂时令目标速度为 0
-      const Eigen::Vector3d kino_goal_vel =
-          Eigen::Vector3d::Zero();
-
-      ROS_WARN_STREAM(
-          "\n========== Kinodynamic A* Test =========="
-          << "\nstart position : "
-          << kino_start_pos.transpose()
-          << "\nstart velocity : "
-          << kino_start_vel.transpose()
-          << "\nstart accel    : "
-          << kino_start_acc.transpose()
-          << "\ngoal position  : "
-          << kino_goal_pos.transpose()
-          << "\n=========================================");
-
-      // 清除上一次搜索产生的节点状态
-      kinoAstarPtr_->reset();
-
-      // 第一次按照 Fast-Planner 的初始化搜索方式进行搜索
-      int kino_status =
-          kinoAstarPtr_->search(
-              kino_start_pos,
-              kino_start_vel,
-              kino_start_acc,
-              kino_goal_pos,
-              kino_goal_vel,
-              true);
-
-      // 第一次失败时，再进行一次普通搜索
-      if (kino_status ==
-          fast_planner::KinodynamicAstar::NO_PATH)
+      for (size_t i = 0; i < path.size(); ++i)
       {
-        ROS_WARN(
-            "[KinodynamicAstar Test] "
-            "initial search failed, retry normal search.");
+        const Eigen::Vector3d diff =
+            path[i] - kino_start_pos;
 
+        const double linf_dist =
+            diff.cwiseAbs().maxCoeff();
+
+        if (linf_dist > farthest_linf_dist)
+        {
+          farthest_linf_dist = linf_dist;
+          farthest_euclidean_dist = diff.norm();
+          farthest_idx = i;
+        }
+      }
+
+      // 为了真正观察 motion primitive 扩展，
+      // 不在候选点太近时立刻执行测试。
+      const double min_kino_test_linf_dist = 2.0;
+
+      if (farthest_linf_dist < min_kino_test_linf_dist)
+      {
+        ROS_WARN_STREAM_THROTTLE(
+            1.0,
+            "[KinodynamicAstar Test] "
+            "waiting for a farther path point..."
+            << "\nL-inf distance : "
+            << farthest_linf_dist
+            << " m"
+            << "\nrequired       : "
+            << min_kino_test_linf_dist
+            << " m");
+
+        // 注意：
+        // 此处不把 kinoAstarTestDone_ 设为 true。
+        // 等后续 target 运动后，继续寻找更远的测试点。
+      }
+      else
+      {
+        const Eigen::Vector3d kino_goal_pos =
+            path[farthest_idx];
+
+        // 当前只是搜索验证，暂时令终点速度为 0
+        const Eigen::Vector3d kino_goal_vel =
+            Eigen::Vector3d::Zero();
+
+        // --------------------------------------------------------
+        // 3. 打印测试条件
+        // --------------------------------------------------------
+        ROS_WARN_STREAM(
+            "\n========== Kinodynamic A* Test =========="
+            << "\npath point count : "
+            << path.size()
+            << "\nfarthest index   : "
+            << farthest_idx
+            << "\nL-inf distance   : "
+            << farthest_linf_dist
+            << " m"
+            << "\nEuclidean dist   : "
+            << farthest_euclidean_dist
+            << " m"
+            << "\nstart position   : "
+            << kino_start_pos.transpose()
+            << "\nstart velocity   : "
+            << kino_start_vel.transpose()
+            << "\nstart accel      : "
+            << kino_start_acc.transpose()
+            << "\ngoal position    : "
+            << kino_goal_pos.transpose()
+            << "\n=========================================");
+
+        // --------------------------------------------------------
+        // 4. 第一次搜索：使用 Fast-Planner 的初始化搜索模式
+        // --------------------------------------------------------
         kinoAstarPtr_->reset();
 
-        kino_status =
+        int kino_status =
             kinoAstarPtr_->search(
                 kino_start_pos,
                 kino_start_vel,
                 kino_start_acc,
                 kino_goal_pos,
                 kino_goal_vel,
-                false);
-      }
+                true);
 
-      // 搜索成功
-      if (kino_status !=
-          fast_planner::KinodynamicAstar::NO_PATH)
-      {
-        // 每隔 0.1 s 对 Kino 搜索结果采样一个位置点
-        std::vector<Eigen::Vector3d> kino_path =
-            kinoAstarPtr_->getKinoTraj(0.1);
-
-        ROS_WARN_STREAM(
-            "[KinodynamicAstar Test] SUCCESS"
-            << "\nstatus      : "
-            << kino_status
-            << "\npath points : "
-            << kino_path.size());
-
-        if (!kino_path.empty())
+        // --------------------------------------------------------
+        // 5. 初始化搜索失败时，再进行一次普通搜索
+        // --------------------------------------------------------
+        if (kino_status ==
+            fast_planner::KinodynamicAstar::NO_PATH)
         {
-          ROS_WARN_STREAM(
-              "[KinodynamicAstar Test]"
-              << "\nfirst point : "
-              << kino_path.front().transpose()
-              << "\nlast point  : "
-              << kino_path.back().transpose());
-        }
-      }
-      else
-      {
-        ROS_ERROR(
-            "[KinodynamicAstar Test] NO PATH.");
-      }
+          ROS_WARN(
+              "[KinodynamicAstar Test] "
+              "initial search failed, retry normal search.");
 
-      // 当前只进行一次测试，防止 20 Hz 不断重复 Kino 搜索
-      kinoAstarTestDone_ = true;
+          kinoAstarPtr_->reset();
+
+          kino_status =
+              kinoAstarPtr_->search(
+                  kino_start_pos,
+                  kino_start_vel,
+                  kino_start_acc,
+                  kino_goal_pos,
+                  kino_goal_vel,
+                  false);
+        }
+
+        // --------------------------------------------------------
+        // 6. 获取本次搜索使用的节点
+        // --------------------------------------------------------
+        std::vector<fast_planner::PathNodePtr> visited_nodes =
+            kinoAstarPtr_->getVisitedNodes();
+
+        // --------------------------------------------------------
+        // 7. 搜索成功
+        // --------------------------------------------------------
+        if (kino_status !=
+            fast_planner::KinodynamicAstar::NO_PATH)
+        {
+          // 每 0.1 s 对 Kino trajectory 采样一次
+          std::vector<Eigen::Vector3d> kino_path =
+              kinoAstarPtr_->getKinoTraj(0.1);
+
+          // RViz 中与原 Elastic A* 使用不同的 marker 名称
+          visPtr_->visualize_path(
+              kino_path,
+              "kino_astar_test");
+
+          ROS_WARN_STREAM(
+              "[KinodynamicAstar Test] SUCCESS"
+              << "\nstatus        : "
+              << kino_status
+              << "\nvisited nodes : "
+              << visited_nodes.size()
+              << "\npath points   : "
+              << kino_path.size());
+
+          if (!kino_path.empty())
+          {
+            ROS_WARN_STREAM(
+                "[KinodynamicAstar Test]"
+                << "\nfirst point   : "
+                << kino_path.front().transpose()
+                << "\nlast point    : "
+                << kino_path.back().transpose());
+          }
+        }
+        else
+        {
+          ROS_ERROR_STREAM(
+              "[KinodynamicAstar Test] NO PATH"
+              << "\nvisited nodes : "
+              << visited_nodes.size());
+        }
+
+        // 当前只进行一次真正的 Kino A* 测试
+        kinoAstarTestDone_ = true;
+      }
     }
 
     std::vector<Eigen::Vector3d> visible_ps;
