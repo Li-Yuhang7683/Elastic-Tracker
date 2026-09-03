@@ -14,6 +14,7 @@
 #include <atomic>
 #include <env/env.hpp>
 #include <prediction/prediction.hpp>
+#include <kino/kinodynamic_astar.h>
 #include <thread>
 #include <visualization/visualization.hpp>
 #include <wr_msg/wr_msg.hpp>
@@ -35,6 +36,10 @@ class Nodelet : public nodelet::Nodelet {
   std::shared_ptr<visualization::Visualization> visPtr_;
   std::shared_ptr<traj_opt::TrajOpt> trajOptPtr_;
   std::shared_ptr<prediction::Predict> prePtr_;
+
+  fast_planner::KinodynamicAstar::Ptr kinoAstarPtr_;
+
+  bool kinoAstarInitialized_ = false;
 
   // NOTE planning or fake target
   bool fake_ = false;
@@ -151,6 +156,25 @@ class Nodelet : public nodelet::Nodelet {
     if (!odom_received_ || !map_received_) {
       return;
     }
+
+    // NOTE obtain map
+    while (gridmap_lock_.test_and_set())
+      ;
+    gridmapPtr_->from_msg(map_msg_);
+
+    
+    replanStateMsg_.occmap = map_msg_;
+    gridmap_lock_.clear();
+    prePtr_->setMap(*gridmapPtr_);
+
+    if (!kinoAstarInitialized_)
+    {
+      kinoAstarPtr_->init();
+      kinoAstarInitialized_ = true;
+
+      ROS_INFO("[KinodynamicAstar] initialization finished.");
+    }
+
     // obtain state of odom
     while (odom_lock_.test_and_set())
       ;
@@ -231,13 +255,7 @@ class Nodelet : public nodelet::Nodelet {
       }
     }
 
-    // NOTE obtain map
-    while (gridmap_lock_.test_and_set())
-      ;
-    gridmapPtr_->from_msg(map_msg_);
-    replanStateMsg_.occmap = map_msg_;
-    gridmap_lock_.clear();
-    prePtr_->setMap(*gridmapPtr_);
+
 
     // visualize the ray from drone to target
     if (envPtr_->checkRayValid(odom_p, target_p)) {
@@ -752,6 +770,9 @@ class Nodelet : public nodelet::Nodelet {
     nh.getParam("fake", fake_);
 
     gridmapPtr_ = std::make_shared<mapping::OccGridMap>();
+    kinoAstarPtr_ = std::make_shared<fast_planner::KinodynamicAstar>();
+    kinoAstarPtr_->setParam(nh);
+    kinoAstarPtr_->setEnvironment(gridmapPtr_);
     envPtr_ = std::make_shared<env::Env>(nh, gridmapPtr_);
     visPtr_ = std::make_shared<visualization::Visualization>(nh);
     trajOptPtr_ = std::make_shared<traj_opt::TrajOpt>(nh);

@@ -44,6 +44,7 @@ src/${PROJECT_NAME}_nodelet.cpp
 )
 
 target_link_libraries(${PROJECT_NAME}_nodelet
+  kino_astar
   ${catkin_LIBRARIES}
 )
 

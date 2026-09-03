@@ -40,6 +40,59 @@
     <param name="prediction/rho_a" value="1.0"/>
     <param name="prediction/vmax" value="4.0"/>
 
+    <!-- Kinodynamic A* parameters -->
+
+    <param name="search/max_tau"
+       value="0.6"
+       type="double"/>
+
+    <param name="search/init_max_tau"
+       value="0.8"
+       type="double"/>
+
+    <param name="search/max_vel"
+       value="3.0"
+       type="double"/>
+
+    <param name="search/max_acc"
+       value="6.0"
+       type="double"/>
+
+    <param name="search/w_time"
+       value="10.0"
+       type="double"/>
+
+    <param name="search/horizon"
+       value="7.0"
+       type="double"/>
+
+    <param name="search/resolution_astar"
+       value="0.1"
+       type="double"/>
+
+    <param name="search/time_resolution"
+       value="0.8"
+       type="double"/>
+
+    <param name="search/lambda_heu"
+       value="5.0"
+       type="double"/>
+
+    <param name="search/allocate_num"
+       value="100000"
+       type="int"/>
+
+    <param name="search/check_num"
+       value="5"
+       type="int"/>
+
+    <param name="search/optimistic"
+       value="true"
+       type="bool"/>
+
+
+
+
   </node>
   <node pkg="planning" name="traj_server" type="traj_server" output="screen">
     <remap from="~position_cmd" to="position_cmd"/>
