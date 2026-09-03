@@ -16,6 +16,7 @@
 #include <env/env.hpp>
 #include <prediction/prediction.hpp>
 #include <kino/kinodynamic_astar.h>
+#include <string>
 #include <thread>
 #include <visualization/visualization.hpp>
 #include <wr_msg/wr_msg.hpp>
@@ -43,12 +44,6 @@ class Nodelet : public nodelet::Nodelet {
   fast_planner::KinodynamicAstar::Ptr kinoAstarPtr_;
 
   bool kinoAstarInitialized_ = false;
-
-  // Kinodynamic A* 与原 Elastic A* 的实时旁路对比周期。
-  // 原规划器仍按 plan_hz 正常重规划；Kino 对比只每 0.5 s 运行一次，
-  // 避免调试阶段给系统增加过大的额外计算负担。
-  ros::Time lastKinoCompareTime_;
-  double kinoCompareInterval_ = 0.5;
 
   // NOTE planning or fake target
   bool fake_ = false;
@@ -233,6 +228,299 @@ class Nodelet : public nodelet::Nodelet {
     gridmap_lock_.clear();
   }
 
+  // ============================================================
+  // Kino 主规划链：
+  //
+  //   No-A* Visibility Selector
+  //          -> Kinodynamic A*
+  //          -> SFC
+  //          -> Visibility-aware MINCO
+  //
+  // 返回 true：
+  //   已经生成一条通过碰撞检查、可以交给 pub_traj() 的轨迹。
+  //
+  // 返回 false：
+  //   主 callback 会立即回退到原 Elastic Tracker 前端。
+  // ============================================================
+  bool generate_kino_primary_trajectory(
+      const Eigen::MatrixXd& iniState,
+      const Eigen::Vector3d& target_v,
+      const std::vector<Eigen::Vector3d>& target_predict,
+      const ros::Time& replan_stamp,
+      Trajectory& traj_out,
+      std::string& fail_reason) {
+    fail_reason.clear();
+
+    if (!kinoAstarInitialized_) {
+      fail_reason = "Kinodynamic A* is not initialized.";
+      return false;
+    }
+
+    if (target_predict.size() < 2) {
+      fail_reason = "target prediction has fewer than 2 points.";
+      return false;
+    }
+
+    const Eigen::Vector3d start_pos = iniState.col(0);
+    const Eigen::Vector3d start_vel = iniState.col(1);
+    const Eigen::Vector3d start_acc = iniState.col(2);
+
+    // ----------------------------------------------------------
+    // 1. No-A* visibility waypoint selector
+    // ----------------------------------------------------------
+    std::vector<Eigen::Vector3d> selected_waypoints;
+
+    if (!envPtr_->selectVisibleWaypoints(
+            start_pos,
+            target_predict,
+            selected_waypoints)) {
+      fail_reason = "visibility waypoint selector failed.";
+      return false;
+    }
+
+    if (selected_waypoints.size() < 2) {
+      fail_reason = "not enough selected visibility waypoints.";
+      return false;
+    }
+
+    visPtr_->visualize_pointcloud(
+        selected_waypoints,
+        "kino_way_pts_no_astar");
+
+    // ----------------------------------------------------------
+    // 2. 和原 Elastic tracking 保持同样的预测序列长度关系
+    //
+    // 原流程会：
+    //   target_predcit.pop_back();
+    //   way_pts.pop_back();
+    // ----------------------------------------------------------
+    std::vector<Eigen::Vector3d> visible_targets =
+        target_predict;
+
+    std::vector<Eigen::Vector3d> visible_seeds =
+        selected_waypoints;
+
+    visible_targets.pop_back();
+    visible_seeds.pop_back();
+
+    if (visible_targets.empty() ||
+        visible_seeds.empty() ||
+        visible_targets.size() != visible_seeds.size()) {
+      fail_reason = "invalid visibility target/seed sequence.";
+      return false;
+    }
+
+    // ----------------------------------------------------------
+    // 3. 生成 visibility regions
+    //
+    // visible_pair() 可能会修正 seed，因此 Kino 的真正终点
+    // 必须使用修正后的 visible_seeds.back()。
+    // ----------------------------------------------------------
+    std::vector<Eigen::Vector3d> visible_ps;
+    std::vector<double> visible_thetas;
+
+    envPtr_->generate_visible_regions(
+        visible_targets,
+        visible_seeds,
+        visible_ps,
+        visible_thetas);
+
+    if (visible_ps.empty() ||
+        visible_thetas.empty() ||
+        visible_ps.size() != visible_targets.size() ||
+        visible_thetas.size() != visible_targets.size()) {
+      fail_reason = "visible region generation failed.";
+      return false;
+    }
+
+    visPtr_->visualize_pointcloud(
+        visible_ps,
+        "kino_visible_ps");
+
+    visPtr_->visualize_fan_shape_meshes(
+        visible_targets,
+        visible_ps,
+        visible_thetas,
+        "kino_visible_region");
+
+    const Eigen::Vector3d goal_pos =
+        visible_seeds.back();
+
+    const Eigen::Vector3d goal_vel =
+        target_v;
+
+    // ----------------------------------------------------------
+    // 4. Kinodynamic A*
+    // ----------------------------------------------------------
+    kinoAstarPtr_->reset();
+
+    int kino_status =
+        kinoAstarPtr_->search(
+            start_pos,
+            start_vel,
+            start_acc,
+            goal_pos,
+            goal_vel,
+            true);
+
+    if (kino_status ==
+        fast_planner::KinodynamicAstar::NO_PATH) {
+      kinoAstarPtr_->reset();
+
+      kino_status =
+          kinoAstarPtr_->search(
+              start_pos,
+              start_vel,
+              start_acc,
+              goal_pos,
+              goal_vel,
+              false);
+    }
+
+    std::vector<fast_planner::PathNodePtr> visited_nodes =
+        kinoAstarPtr_->getVisitedNodes();
+
+    // 当前正式接管阶段仍要求真正到达 visibility waypoint。
+    // REACH_HORIZON 视为本周期主规划失败，交给 Elastic fallback。
+    if (kino_status !=
+        fast_planner::KinodynamicAstar::REACH_END) {
+      if (kino_status ==
+          fast_planner::KinodynamicAstar::REACH_HORIZON) {
+        fail_reason = "Kinodynamic A* reached horizon before visibility goal.";
+      } else {
+        fail_reason = "Kinodynamic A* found no path.";
+      }
+      return false;
+    }
+
+    std::vector<Eigen::Vector3d> kino_path =
+        kinoAstarPtr_->getKinoTraj(0.1);
+
+    if (kino_path.empty()) {
+      fail_reason = "Kinodynamic A* returned an empty path.";
+      return false;
+    }
+
+    // getKinoTraj() 最后一个采样点可能略早于精确终点，
+    // 补入精确 goal 以确保 SFC 覆盖 MINCO 的终端状态。
+    if ((kino_path.back() - goal_pos).norm() > 1e-3) {
+      kino_path.push_back(goal_pos);
+    }
+
+    pub_kino_path(kino_path);
+
+    // ----------------------------------------------------------
+    // 5. Kino path -> SFC
+    // ----------------------------------------------------------
+    std::vector<Eigen::MatrixXd> kino_hPolys;
+    std::vector<
+        std::pair<Eigen::Vector3d, Eigen::Vector3d>>
+        kino_keyPts;
+
+    envPtr_->generateSFC(
+        kino_path,
+        2.0,
+        kino_hPolys,
+        kino_keyPts);
+
+    if (kino_hPolys.empty()) {
+      fail_reason = "Kino SFC generation returned an empty corridor.";
+      return false;
+    }
+
+    // 主规划器成功时，把当前真正使用的安全走廊显示出来。
+    envPtr_->visCorridor(kino_hPolys);
+    visPtr_->visualize_pairline(
+        kino_keyPts,
+        "kino_keyPts");
+
+    // ----------------------------------------------------------
+    // 6. SFC -> Visibility-aware MINCO
+    // ----------------------------------------------------------
+    Eigen::MatrixXd finState;
+    finState.setZero(3, 3);
+    finState.col(0) = goal_pos;
+    finState.col(1) = target_v;
+
+    Trajectory kino_traj;
+
+    const bool minco_success =
+        trajOptPtr_->generate_traj(
+            iniState,
+            finState,
+            visible_targets,
+            visible_ps,
+            visible_thetas,
+            kino_hPolys,
+            kino_traj);
+
+    if (!minco_success) {
+      fail_reason = "visibility-aware MINCO failed.";
+      return false;
+    }
+
+    const double duration =
+        kino_traj.getTotalDuration();
+
+    if (duration <= 0.0) {
+      fail_reason = "MINCO returned a non-positive trajectory duration.";
+      return false;
+    }
+
+    // ----------------------------------------------------------
+    // 7. 在真正交给无人机前，再做一次完整地图碰撞检查
+    //
+    // 同时拒绝当前 rolling map 之外的点。
+    // ----------------------------------------------------------
+    Eigen::Vector3d collision_point =
+        Eigen::Vector3d::Zero();
+
+    for (double t = 0.0;
+         t <= duration;
+         t += 0.01) {
+      const Eigen::Vector3d p =
+          kino_traj.getPos(t);
+
+      if (!gridmapPtr_->isInMap(p) ||
+          gridmapPtr_->isOccupied(p)) {
+        collision_point = p;
+
+        fail_reason =
+            "Kino MINCO trajectory is outside map or in collision at [" +
+            std::to_string(p.x()) + ", " +
+            std::to_string(p.y()) + ", " +
+            std::to_string(p.z()) + "].";
+
+        return false;
+      }
+    }
+
+    // 独立绿色 Path 继续保留，方便确认“实际执行轨迹”
+    // 与 Kino MINCO 调试轨迹一致。
+    pub_kino_minco_path(kino_traj);
+
+    // 到这里才允许交给主 callback 发布。
+    traj_out = kino_traj;
+
+    ROS_WARN_STREAM(
+        "[KINO PRIMARY] trajectory ready"
+        << "\nvisited nodes  : "
+        << visited_nodes.size()
+        << "\nkino path pts  : "
+        << kino_path.size()
+        << "\ncorridor count : "
+        << kino_hPolys.size()
+        << "\nvisible points : "
+        << visible_ps.size()
+        << "\nduration       : "
+        << duration
+        << " s"
+        << "\npiece num      : "
+        << kino_traj.getPieceNum());
+
+    return true;
+  }
+
   // NOTE main callback
   void plan_timer_callback(const ros::TimerEvent& event) {
     heartbeat_pub_.publish(std_msgs::Empty());
@@ -382,460 +670,238 @@ class Nodelet : public nodelet::Nodelet {
     replanStateMsg_.iniState.resize(9);
     Eigen::Map<Eigen::MatrixXd>(replanStateMsg_.iniState.data(), 3, 3) = iniState;
 
-    // NOTE path searching
+    // ============================================================
+    // PRIMARY / FALLBACK planning
+    //
+    // Normal tracking:
+    //
+    //   PRIMARY:
+    //     No-A* Selector -> Kino -> SFC -> Visibility MINCO
+    //
+    //   FALLBACK:
+    //     原 Elastic findVisiblePath -> pts2path -> SFC -> MINCO
+    //
+    // Landing:
+    //   暂时保持原 Elastic landing 流程，不在本阶段修改。
+    // ============================================================
     Eigen::Vector3d p_start = iniState.col(0);
-    std::vector<Eigen::Vector3d> path, way_pts;
 
-    // NOTE calculate time of path searching, corridor generation and optimization
+    Trajectory traj;
 
-    // static double t_path_ = 0;
-    // static double t_corridor_ = 0;
-    // static double t_optimization_ = 0;
-    // static int times_path_ = 0;
-    // static int times_corridor_ = 0;
-    // static int times_optimization_ = 0;
-    // double t_path = 0;
+    bool kino_primary_used = false;
+    bool elastic_fallback_used = false;
+    bool elastic_landing_used = false;
 
+    // predict() 失败时保持失败状态，直接进入后面的通用安全处理。
     if (generate_new_traj_success) {
-      // ros::Time t_front0 = ros::Time::now();
       if (land_triger_received_) {
-        generate_new_traj_success = envPtr_->short_astar(p_start, target_p, path);
-      } else {
-        generate_new_traj_success = envPtr_->findVisiblePath(p_start, target_predcit, way_pts, path);
-      }
-      // ros::Time t_end0 = ros::Time::now();
-      // t_path += (t_end0 - t_front0).toSec() * 1e3;
-    }
+        // ========================================================
+        // Landing：保持原 Elastic Tracker 实现
+        // ========================================================
+        elastic_landing_used = true;
 
-    // ============================================================
-    // No-A* Visibility Selector
-    //        -> Kinodynamic A*
-    //        -> SFC
-    //        -> Visibility-aware MINCO
-    //
-    // 这是当前最重要的旁路验证：
-    //
-    //   1. observation waypoints 不再来自 findVisiblePath()；
-    //   2. observation waypoints 由 selectVisibleWaypoints() 纯几何选择；
-    //   3. 整条飞行路径完全由 Kinodynamic A* 生成；
-    //   4. Kino path 生成 SFC；
-    //   5. 使用新 selector 产生的 seeds 生成 visible regions；
-    //   6. 进入 Elastic Tracker 原 tracking MINCO 接口；
-    //   7. 只在 RViz 显示，不调用 pub_traj()。
-    //
-    // 注意：
-    // 原 Elastic Tracker 主链仍在下面继续执行，
-    // 所以本阶段即使旁路失败，无人机也不会失去原规划器控制。
-    // ============================================================
-    if (generate_new_traj_success &&
-        !land_triger_received_ &&
-        kinoAstarInitialized_ &&
-        target_predcit.size() >= 2)
-    {
-      const ros::Time kino_compare_now = ros::Time::now();
-      const double kino_compare_dt =
-          (kino_compare_now - lastKinoCompareTime_).toSec();
+        std::vector<Eigen::Vector3d> path;
 
-      if (lastKinoCompareTime_.isZero() ||
-          kino_compare_dt >= kinoCompareInterval_)
-      {
-        lastKinoCompareTime_ = kino_compare_now;
+        generate_new_traj_success =
+            envPtr_->short_astar(
+                p_start,
+                target_p,
+                path);
 
-        const Eigen::Vector3d kino_start_pos =
-            iniState.col(0);
-        const Eigen::Vector3d kino_start_vel =
-            iniState.col(1);
-        const Eigen::Vector3d kino_start_acc =
-            iniState.col(2);
-
-        // --------------------------------------------------------
-        // 1. 纯 visibility waypoint selector
-        //
-        // 这里不调用 findVisiblePath()，
-        // 也不调用 astar_search() / short_astar() / pts2path()。
-        // --------------------------------------------------------
-        std::vector<Eigen::Vector3d>
-            kino_no_astar_way_pts;
-
-        const bool kino_selector_success =
-            envPtr_->selectVisibleWaypoints(
-                kino_start_pos,
-                target_predcit,
-                kino_no_astar_way_pts);
-
-        if (!kino_selector_success ||
-            kino_no_astar_way_pts.size() < 2)
-        {
-          ROS_ERROR(
-              "[NoAstar Selector] FAILED: "
-              "cannot generate enough visibility waypoints.");
-        }
-        else
-        {
-          // 可视化新 selector 产生的 waypoint。
-          visPtr_->visualize_pointcloud(
-              kino_no_astar_way_pts,
-              "kino_way_pts_no_astar");
-
-          // ------------------------------------------------------
-          // 2. 与原 Elastic tracking 语义保持一致：
-          //
-          // 原代码会：
-          //   target_predcit.pop_back();
-          //   way_pts.pop_back();
-          //
-          // 因此这里对副本做完全相同处理。
-          // ------------------------------------------------------
-          std::vector<Eigen::Vector3d>
-              kino_visible_targets = target_predcit;
-
-          std::vector<Eigen::Vector3d>
-              kino_visible_seeds = kino_no_astar_way_pts;
-
-          kino_visible_targets.pop_back();
-          kino_visible_seeds.pop_back();
-
-          // ------------------------------------------------------
-          // 3. 基于新 selector 的 seeds 生成 visible regions。
-          //
-          // generate_visible_regions() 内部的 visible_pair()
-          // 可能会对 seed 做小幅修正，因此 Kino 搜索终点必须在
-          // 这一步之后再确定。
-          // ------------------------------------------------------
-          std::vector<Eigen::Vector3d>
-              kino_visible_ps;
-          std::vector<double>
-              kino_visible_thetas;
-
-          envPtr_->generate_visible_regions(
-              kino_visible_targets,
-              kino_visible_seeds,
-              kino_visible_ps,
-              kino_visible_thetas);
-
-          if (kino_visible_seeds.empty() ||
-              kino_visible_ps.empty())
-          {
-            ROS_ERROR(
-                "[NoAstar Selector] FAILED: "
-                "visible region generation returned empty data.");
+        if (generate_new_traj_success) {
+          for (const auto& p : target_predcit) {
+            path.push_back(p);
           }
-          else
-          {
-            // 最后一个经过 visible_pair() 修正后的 seed，
-            // 就作为当前 Kino tracking 的末端 waypoint。
-            const Eigen::Vector3d kino_goal_pos =
-                kino_visible_seeds.back();
 
-            const Eigen::Vector3d kino_goal_vel =
-                target_v;
+          if (path.size() < 2) {
+            generate_new_traj_success = false;
+          }
+        }
 
-            ROS_WARN_STREAM(
-                "\n========== No-A* Kino Tracking Test =========="
-                << "\npredicted targets : "
-                << target_predcit.size()
-                << "\nselected waypoints: "
-                << kino_no_astar_way_pts.size()
-                << "\nvisible seeds     : "
-                << kino_visible_seeds.size()
-                << "\ngoal distance     : "
-                << (kino_goal_pos -
-                    kino_start_pos).norm()
-                << " m"
-                << "\nstart position    : "
-                << kino_start_pos.transpose()
-                << "\nstart velocity    : "
-                << kino_start_vel.transpose()
-                << "\ngoal position     : "
-                << kino_goal_pos.transpose()
-                << "\ngoal velocity     : "
-                << kino_goal_vel.transpose()
-                << "\n=============================================");
+        if (generate_new_traj_success) {
+          visPtr_->visualize_path(
+              path,
+              "astar");
 
-            // ----------------------------------------------------
-            // 4. Kinodynamic A*
-            // ----------------------------------------------------
-            kinoAstarPtr_->reset();
+          std::vector<Eigen::MatrixXd> hPolys;
+          std::vector<
+              std::pair<Eigen::Vector3d, Eigen::Vector3d>>
+              keyPts;
 
-            int kino_status =
-                kinoAstarPtr_->search(
-                    kino_start_pos,
-                    kino_start_vel,
-                    kino_start_acc,
-                    kino_goal_pos,
-                    kino_goal_vel,
-                    true);
+          envPtr_->generateSFC(
+              path,
+              2.0,
+              hPolys,
+              keyPts);
 
-            if (kino_status ==
-                fast_planner::KinodynamicAstar::NO_PATH)
-            {
-              ROS_WARN(
-                  "[No-A* Kino] initial search failed, "
-                  "retry normal search.");
+          if (hPolys.empty()) {
+            generate_new_traj_success = false;
+          } else {
+            envPtr_->visCorridor(hPolys);
+            visPtr_->visualize_pairline(
+                keyPts,
+                "keyPts");
 
-              kinoAstarPtr_->reset();
+            Eigen::MatrixXd finState;
+            finState.setZero(3, 3);
+            finState.col(0) =
+                target_predcit.back();
 
-              kino_status =
-                  kinoAstarPtr_->search(
-                      kino_start_pos,
-                      kino_start_vel,
-                      kino_start_acc,
-                      kino_goal_pos,
-                      kino_goal_vel,
-                      false);
+            generate_new_traj_success =
+                trajOptPtr_->generate_traj(
+                    iniState,
+                    finState,
+                    target_predcit,
+                    hPolys,
+                    traj);
+          }
+        }
+      }
+      else {
+        // ========================================================
+        // 1. Kino 主规划器
+        // ========================================================
+        std::string kino_fail_reason;
+
+        kino_primary_used =
+            generate_kino_primary_trajectory(
+                iniState,
+                target_v,
+                target_predcit,
+                replan_stamp,
+                traj,
+                kino_fail_reason);
+
+        if (kino_primary_used) {
+          generate_new_traj_success = true;
+        }
+        else {
+          // ======================================================
+          // 2. Kino 失败 -> 原 Elastic Tracker fallback
+          // ======================================================
+          ROS_WARN_STREAM(
+              "[KINO PRIMARY] FAILED"
+              << "\nreason: "
+              << kino_fail_reason
+              << "\n[ELASTIC FALLBACK] attempting original planner.");
+
+          elastic_fallback_used = true;
+
+          std::vector<Eigen::Vector3d> path;
+          std::vector<Eigen::Vector3d> way_pts;
+
+          generate_new_traj_success =
+              envPtr_->findVisiblePath(
+                  p_start,
+                  target_predcit,
+                  way_pts,
+                  path);
+
+          if (generate_new_traj_success) {
+            if (target_predcit.size() < 2 ||
+                way_pts.size() < 2) {
+              generate_new_traj_success = false;
+            }
+          }
+
+          if (generate_new_traj_success) {
+            visPtr_->visualize_path(
+                path,
+                "astar");
+
+            // 和原 Elastic Tracker 完全相同：
+            // 删除最后一个 prediction / waypoint 后生成 visibility region。
+            target_predcit.pop_back();
+            way_pts.pop_back();
+
+            std::vector<Eigen::Vector3d> visible_ps;
+            std::vector<double> thetas;
+
+            envPtr_->generate_visible_regions(
+                target_predcit,
+                way_pts,
+                visible_ps,
+                thetas);
+
+            visPtr_->visualize_pointcloud(
+                visible_ps,
+                "visible_ps");
+
+            visPtr_->visualize_fan_shape_meshes(
+                target_predcit,
+                visible_ps,
+                thetas,
+                "visible_region");
+
+            visPtr_->visualize_pointcloud(
+                way_pts,
+                "way_pts");
+
+            // 原 Elastic 的第二层几何连接。
+            // 如果直线不可行，pts2path() 内部仍可能调用 short_astar()。
+            way_pts.insert(
+                way_pts.begin(),
+                p_start);
+
+            envPtr_->pts2path(
+                way_pts,
+                path);
+
+            if (path.size() < 2) {
+              generate_new_traj_success = false;
             }
 
-            std::vector<fast_planner::PathNodePtr>
-                kino_visited_nodes =
-                    kinoAstarPtr_->getVisitedNodes();
-
-            // 当前仍要求真正到达 visibility waypoint。
-            if (kino_status ==
-                fast_planner::KinodynamicAstar::REACH_END)
-            {
-              std::vector<Eigen::Vector3d>
-                  kino_no_astar_path =
-                      kinoAstarPtr_->getKinoTraj(0.1);
-
-              // 确保精确末端 waypoint 包含在 SFC 路径中。
-              if (kino_no_astar_path.empty() ||
-                  (kino_no_astar_path.back() -
-                   kino_goal_pos).norm() > 1e-3)
-              {
-                kino_no_astar_path.push_back(
-                    kino_goal_pos);
-              }
-
-              pub_kino_path(
-                  kino_no_astar_path);
-
-              // --------------------------------------------------
-              // 5. Kino path -> SFC
-              // --------------------------------------------------
-              std::vector<Eigen::MatrixXd>
-                  kino_no_astar_hPolys;
-
+            if (generate_new_traj_success) {
+              std::vector<Eigen::MatrixXd> hPolys;
               std::vector<
-                  std::pair<
-                      Eigen::Vector3d,
-                      Eigen::Vector3d>>
-                  kino_no_astar_keyPts;
+                  std::pair<Eigen::Vector3d, Eigen::Vector3d>>
+                  keyPts;
 
               envPtr_->generateSFC(
-                  kino_no_astar_path,
+                  path,
                   2.0,
-                  kino_no_astar_hPolys,
-                  kino_no_astar_keyPts);
+                  hPolys,
+                  keyPts);
 
-              if (kino_no_astar_hPolys.empty())
-              {
-                ROS_ERROR(
-                    "[No-A* Kino->SFC] FAILED: "
-                    "corridor is empty.");
+              if (hPolys.empty()) {
+                generate_new_traj_success = false;
               }
-              else
-              {
-                // ------------------------------------------------
-                // 6. Kino SFC -> Visibility-aware MINCO
-                // ------------------------------------------------
-                Eigen::MatrixXd
-                    kino_no_astar_finState;
+              else {
+                envPtr_->visCorridor(
+                    hPolys);
 
-                kino_no_astar_finState.setZero(3, 3);
-                kino_no_astar_finState.col(0) =
-                    kino_goal_pos;
-                kino_no_astar_finState.col(1) =
+                visPtr_->visualize_pairline(
+                    keyPts,
+                    "keyPts");
+
+                Eigen::MatrixXd finState;
+                finState.setZero(3, 3);
+                finState.col(0) =
+                    path.back();
+                finState.col(1) =
                     target_v;
 
-                Trajectory
-                    kino_no_astar_visibility_traj;
-
-                const bool
-                    kino_no_astar_minco_success =
-                        trajOptPtr_->generate_traj(
-                            iniState,
-                            kino_no_astar_finState,
-                            kino_visible_targets,
-                            kino_visible_ps,
-                            kino_visible_thetas,
-                            kino_no_astar_hPolys,
-                            kino_no_astar_visibility_traj);
-
-                if (!kino_no_astar_minco_success)
-                {
-                  ROS_ERROR(
-                      "[No-A* Kino->SFC->VisibilityMINCO] "
-                      "FAILED: generate_traj returned false.");
-                }
-                else
-                {
-                  // ----------------------------------------------
-                  // 7. 对旁路 MINCO 轨迹做碰撞检查
-                  // ----------------------------------------------
-                  bool
-                      kino_no_astar_collision_free =
-                          true;
-
-                  Eigen::Vector3d
-                      kino_collision_point =
-                          Eigen::Vector3d::Zero();
-
-                  const double
-                      kino_traj_duration =
-                          kino_no_astar_visibility_traj
-                              .getTotalDuration();
-
-                  for (double t = 0.0;
-                       t <= kino_traj_duration;
-                       t += 0.01)
-                  {
-                    const Eigen::Vector3d p =
-                        kino_no_astar_visibility_traj
-                            .getPos(t);
-
-                    if (!gridmapPtr_->isInMap(p) ||
-                        gridmapPtr_->isOccupied(p))
-                    {
-                      kino_no_astar_collision_free =
-                          false;
-                      kino_collision_point = p;
-                      break;
-                    }
-                  }
-
-                  // 仍然只发布 RViz Path。
-                  // 绝不调用 pub_traj()。
-                  pub_kino_minco_path(
-                      kino_no_astar_visibility_traj);
-
-                  if (kino_no_astar_collision_free)
-                  {
-                    ROS_WARN_STREAM(
-                        "[No-A* Kino->SFC->VisibilityMINCO] "
-                        "SUCCESS"
-                        << "\nstatus          : "
-                        << kino_status
-                        << "\nvisited nodes   : "
-                        << kino_visited_nodes.size()
-                        << "\nkino path pts   : "
-                        << kino_no_astar_path.size()
-                        << "\ncorridor count  : "
-                        << kino_no_astar_hPolys.size()
-                        << "\nvisible points  : "
-                        << kino_visible_ps.size()
-                        << "\nduration        : "
-                        << kino_traj_duration
-                        << " s"
-                        << "\npiece num       : "
-                        << kino_no_astar_visibility_traj
-                               .getPieceNum()
-                        << "\ncollision free  : YES");
-                  }
-                  else
-                  {
-                    ROS_ERROR_STREAM(
-                        "[No-A* Kino->SFC->VisibilityMINCO] "
-                        "GENERATED BUT COLLISION FOUND"
-                        << "\ncollision point : "
-                        << kino_collision_point.transpose());
-                  }
-                }
+                generate_new_traj_success =
+                    trajOptPtr_->generate_traj(
+                        iniState,
+                        finState,
+                        target_predcit,
+                        visible_ps,
+                        thetas,
+                        hPolys,
+                        traj);
               }
-            }
-            else if (kino_status ==
-                     fast_planner::KinodynamicAstar::REACH_HORIZON)
-            {
-              ROS_WARN_STREAM(
-                  "[No-A* Kino] REACH_HORIZON, "
-                  "skip MINCO this cycle."
-                  << "\nvisited nodes : "
-                  << kino_visited_nodes.size());
-            }
-            else
-            {
-              ROS_ERROR_STREAM(
-                  "[No-A* Kino] NO PATH"
-                  << "\nvisited nodes : "
-                  << kino_visited_nodes.size());
             }
           }
         }
       }
     }
 
-    std::vector<Eigen::Vector3d> visible_ps;
-    std::vector<double> thetas;
-    Trajectory traj;
+    // 当前实际被选择的轨迹统一显示在原 "traj" topic。
     if (generate_new_traj_success) {
-      visPtr_->visualize_path(path, "astar");
-      if (land_triger_received_) {
-        for (const auto& p : target_predcit) {
-          path.push_back(p);
-        }
-      } else {
-        // NOTE generate visible regions
-        target_predcit.pop_back();
-        way_pts.pop_back();
-        // ros::Time t_front1 = ros::Time::now();
-        envPtr_->generate_visible_regions(target_predcit, way_pts,
-                                          visible_ps, thetas);
-        // ros::Time t_end1 = ros::Time::now();
-        // t_path += (t_end1 - t_front1).toSec() * 1e3;
-        visPtr_->visualize_pointcloud(visible_ps, "visible_ps");
-        visPtr_->visualize_fan_shape_meshes(target_predcit, visible_ps, thetas, "visible_region");
-
-        // TODO change the final state
-        std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> rays;
-        for (int i = 0; i < (int)way_pts.size(); ++i) {
-          rays.emplace_back(target_predcit[i], way_pts[i]);
-        }
-        visPtr_->visualize_pointcloud(way_pts, "way_pts");
-        way_pts.insert(way_pts.begin(), p_start);
-        // ros::Time t_front2 = ros::Time::now();
-        envPtr_->pts2path(way_pts, path);
-        // ros::Time t_end2 = ros::Time::now();
-        // t_path += (t_end2 - t_front2).toSec() * 1e3;
-      }
-      // NOTE corridor generating
-      std::vector<Eigen::MatrixXd> hPolys;
-      std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> keyPts;
-
-      // ros::Time t_front3 = ros::Time::now();
-      envPtr_->generateSFC(path, 2.0, hPolys, keyPts);
-      // ros::Time t_end3 = ros::Time::now();
-      // double t_corridor = (t_end3 - t_front3).toSec() * 1e3;
-
-      envPtr_->visCorridor(hPolys);
-      visPtr_->visualize_pairline(keyPts, "keyPts");
-
-      // NOTE trajectory optimization
-      Eigen::MatrixXd finState;
-      finState.setZero(3, 3);
-      finState.col(0) = path.back();
-      finState.col(1) = target_v;
-      // ros::Time t_front4 = ros::Time::now();
-      if (land_triger_received_) {
-        finState.col(0) = target_predcit.back();
-        generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState, target_predcit, hPolys, traj);
-      } else {
-        generate_new_traj_success = trajOptPtr_->generate_traj(iniState, finState,
-                                                               target_predcit, visible_ps, thetas,
-                                                               hPolys, traj);
-      }
-      // ros::Time t_end4 = ros::Time::now();
-      // double t_optimization = (t_end4 - t_front4).toSec() * 1e3;
-
-      // NOTE average calculating time of path searching, corridor generation and optimization
-
-      // t_path_ = (t_path_ * times_path_ + t_path) / (++times_path_);
-      // t_corridor_ = (t_corridor_ * times_corridor_ + t_corridor) / (++times_corridor_);
-      // t_optimization_ = (t_optimization_ * times_optimization_ + t_optimization) / (++times_optimization_);
-
-      // std::cout << "t_path_: " << t_path_ << " ms" << std::endl;
-      // std::cout << "t_corridor_: " << t_corridor_ << " ms" << std::endl;
-      // std::cout << "t_optimization_: " << t_optimization_ << " ms" << std::endl;
-
-      visPtr_->visualize_traj(traj, "traj");
+      visPtr_->visualize_traj(
+          traj,
+          "traj");
     }
 
     // NOTE collision check
@@ -848,7 +914,18 @@ class Nodelet : public nodelet::Nodelet {
     }
     if (valid) {
       force_hover_ = false;
-      ROS_WARN("[planner] REPLAN SUCCESS");
+      if (kino_primary_used) {
+        ROS_WARN("[KINO PRIMARY] REPLAN SUCCESS - drone executes Kino trajectory");
+      }
+      else if (elastic_fallback_used) {
+        ROS_WARN("[ELASTIC FALLBACK] REPLAN SUCCESS - drone executes fallback trajectory");
+      }
+      else if (elastic_landing_used) {
+        ROS_WARN("[ELASTIC LANDING] REPLAN SUCCESS");
+      }
+      else {
+        ROS_WARN("[planner] REPLAN SUCCESS");
+      }
       replanStateMsg_.state = 0;
       replanState_pub_.publish(replanStateMsg_);
       Eigen::Vector3d dp = target_p + target_v * 0.03 - iniState.col(0);
