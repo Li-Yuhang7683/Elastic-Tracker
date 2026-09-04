@@ -4,11 +4,20 @@
   <arg name="rhoTracking_"/>
   <arg name="target_name_"/>
 
-  <!-- <node pkg="nodelet" type="nodelet" name="plan_manage" args="manager" output="screen">
-    <param name="num_worker_threads" value="16"/>
-  </node> -->
+  <!--
+    normal tracking planner:
+      elastic       = 原 Elastic Tracker A*
+      kino          = Kinodynamic A*，禁止 fallback
+      kino_fallback = Kino 主规划 + Elastic fallback
+  -->
+  <arg name="planner_mode_" default="kino_fallback"/>
 
-  <node pkg="nodelet" type="nodelet" name="planning" args="load planning/Nodelet manager" output="screen">
+  <node pkg="nodelet"
+        type="nodelet"
+        name="planning"
+        args="load planning/Nodelet manager"
+        output="screen">
+
     <remap from="~odom" to="odom"/>
     <remap from="~gridmap_inflate" to="gridmap_inflate"/>
     <remap from="~heartbeat" to="heartbeat"/>
@@ -17,6 +26,10 @@
     <remap from="~target" to="$(arg target_name_)"/>
     <remap from="~triger" to="/triger"/>
     <remap from="~land_triger" to="/land_triger"/>
+
+    <param name="planner_mode"
+           value="$(arg planner_mode_)"
+           type="string"/>
 
     <param name="plan_hz" value="20"/>
 
@@ -41,63 +54,64 @@
     <param name="prediction/vmax" value="4.0"/>
 
     <!-- Kinodynamic A* parameters -->
-
     <param name="search/max_tau"
-       value="0.6"
-       type="double"/>
+           value="0.6"
+           type="double"/>
 
     <param name="search/init_max_tau"
-       value="0.8"
-       type="double"/>
+           value="0.8"
+           type="double"/>
 
     <param name="search/max_vel"
-       value="3.0"
-       type="double"/>
+           value="3.0"
+           type="double"/>
 
     <param name="search/max_acc"
-       value="6.0"
-       type="double"/>
+           value="6.0"
+           type="double"/>
 
     <param name="search/w_time"
-       value="10.0"
-       type="double"/>
+           value="10.0"
+           type="double"/>
 
     <param name="search/horizon"
-       value="7.0"
-       type="double"/>
+           value="7.0"
+           type="double"/>
 
     <param name="search/resolution_astar"
-       value="0.1"
-       type="double"/>
+           value="0.1"
+           type="double"/>
 
     <param name="search/time_resolution"
-       value="0.8"
-       type="double"/>
+           value="0.8"
+           type="double"/>
 
     <param name="search/lambda_heu"
-       value="5.0"
-       type="double"/>
+           value="5.0"
+           type="double"/>
 
     <param name="search/allocate_num"
-       value="100000"
-       type="int"/>
+           value="100000"
+           type="int"/>
 
     <param name="search/check_num"
-       value="5"
-       type="int"/>
+           value="5"
+           type="int"/>
 
     <param name="search/optimistic"
-       value="true"
-       type="bool"/>
-
-
-
+           value="true"
+           type="bool"/>
 
   </node>
-  <node pkg="planning" name="traj_server" type="traj_server" output="screen">
+
+  <node pkg="planning"
+        name="traj_server"
+        type="traj_server"
+        output="screen">
     <remap from="~position_cmd" to="position_cmd"/>
     <remap from="~trajectory" to="trajectory"/>
     <remap from="~heartbeat" to="heartbeat"/>
     <param name="time_forward" value="1.0" type="double"/>
   </node>
+
 </launch>

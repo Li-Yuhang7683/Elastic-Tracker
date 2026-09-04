@@ -45,6 +45,12 @@ class Nodelet : public nodelet::Nodelet {
 
   bool kinoAstarInitialized_ = false;
 
+  // normal tracking planner mode:
+  //   elastic       : 原 Elastic Tracker 前端
+  //   kino          : Kinodynamic A*，失败时不回退
+  //   kino_fallback : Kinodynamic A* 主规划器 + 原 Elastic fallback
+  std::string planner_mode_ = "kino_fallback";
+
   // NOTE planning or fake target
   bool fake_ = false;
   Eigen::Vector3d goal_;
@@ -521,6 +527,128 @@ class Nodelet : public nodelet::Nodelet {
     return true;
   }
 
+  // ============================================================
+  // 原 Elastic Tracker normal tracking 链路
+  //
+  //   findVisiblePath()
+  //      -> visibility regions
+  //      -> pts2path()
+  //      -> SFC
+  //      -> visibility-aware MINCO
+  //
+  // 该函数用于：
+  //   1. planner_mode = "elastic" 时作为主规划器；
+  //   2. planner_mode = "kino_fallback" 且 Kino 失败时作为 fallback。
+  // ============================================================
+  bool generate_elastic_tracking_trajectory(
+      const Eigen::MatrixXd& iniState,
+      const Eigen::Vector3d& target_v,
+      std::vector<Eigen::Vector3d> target_predict,
+      Trajectory& traj_out) {
+    const Eigen::Vector3d p_start = iniState.col(0);
+
+    std::vector<Eigen::Vector3d> path;
+    std::vector<Eigen::Vector3d> way_pts;
+
+    bool success =
+        envPtr_->findVisiblePath(
+            p_start,
+            target_predict,
+            way_pts,
+            path);
+
+    if (!success) {
+      return false;
+    }
+
+    if (target_predict.size() < 2 ||
+        way_pts.size() < 2) {
+      return false;
+    }
+
+    visPtr_->visualize_path(
+        path,
+        "astar");
+
+    // 和原 Elastic Tracker 一致：
+    // 删除最后一个 prediction / waypoint 后生成 visibility region。
+    target_predict.pop_back();
+    way_pts.pop_back();
+
+    std::vector<Eigen::Vector3d> visible_ps;
+    std::vector<double> thetas;
+
+    envPtr_->generate_visible_regions(
+        target_predict,
+        way_pts,
+        visible_ps,
+        thetas);
+
+    visPtr_->visualize_pointcloud(
+        visible_ps,
+        "visible_ps");
+
+    visPtr_->visualize_fan_shape_meshes(
+        target_predict,
+        visible_ps,
+        thetas,
+        "visible_region");
+
+    visPtr_->visualize_pointcloud(
+        way_pts,
+        "way_pts");
+
+    // 原 Elastic 的第二层几何连接。
+    // 直线不可行时，pts2path() 内部仍可能调用 short_astar()。
+    way_pts.insert(
+        way_pts.begin(),
+        p_start);
+
+    envPtr_->pts2path(
+        way_pts,
+        path);
+
+    if (path.size() < 2) {
+      return false;
+    }
+
+    std::vector<Eigen::MatrixXd> hPolys;
+    std::vector<
+        std::pair<Eigen::Vector3d, Eigen::Vector3d>>
+        keyPts;
+
+    envPtr_->generateSFC(
+        path,
+        2.0,
+        hPolys,
+        keyPts);
+
+    if (hPolys.empty()) {
+      return false;
+    }
+
+    envPtr_->visCorridor(
+        hPolys);
+
+    visPtr_->visualize_pairline(
+        keyPts,
+        "keyPts");
+
+    Eigen::MatrixXd finState;
+    finState.setZero(3, 3);
+    finState.col(0) = path.back();
+    finState.col(1) = target_v;
+
+    return trajOptPtr_->generate_traj(
+        iniState,
+        finState,
+        target_predict,
+        visible_ps,
+        thetas,
+        hPolys,
+        traj_out);
+  }
+
   // NOTE main callback
   void plan_timer_callback(const ros::TimerEvent& event) {
     heartbeat_pub_.publish(std_msgs::Empty());
@@ -538,8 +666,8 @@ class Nodelet : public nodelet::Nodelet {
     gridmap_lock_.clear();
     prePtr_->setMap(*gridmapPtr_);
 
-    if (!kinoAstarInitialized_)
-    {
+    if (planner_mode_ != "elastic" &&
+        !kinoAstarInitialized_) {
       kinoAstarPtr_->init();
       kinoAstarInitialized_ = true;
 
@@ -671,24 +799,27 @@ class Nodelet : public nodelet::Nodelet {
     Eigen::Map<Eigen::MatrixXd>(replanStateMsg_.iniState.data(), 3, 3) = iniState;
 
     // ============================================================
-    // PRIMARY / FALLBACK planning
+    // Normal tracking planner selection
     //
-    // Normal tracking:
+    // planner_mode = "elastic"
+    //   原 Elastic findVisiblePath -> pts2path -> SFC -> MINCO
     //
-    //   PRIMARY:
-    //     No-A* Selector -> Kino -> SFC -> Visibility MINCO
+    // planner_mode = "kino"
+    //   No-A* Selector -> Kinodynamic A* -> SFC -> Visibility MINCO
+    //   Kino 失败时不回退，适合 A* vs Kino 双机公平对比。
     //
-    //   FALLBACK:
-    //     原 Elastic findVisiblePath -> pts2path -> SFC -> MINCO
+    // planner_mode = "kino_fallback"
+    //   Kino 为主规划器，失败时回退到原 Elastic。
     //
-    // Landing:
-    //   暂时保持原 Elastic landing 流程，不在本阶段修改。
+    // Landing：
+    //   保持原 Elastic landing 流程。
     // ============================================================
     Eigen::Vector3d p_start = iniState.col(0);
 
     Trajectory traj;
 
     bool kino_primary_used = false;
+    bool elastic_tracking_used = false;
     bool elastic_fallback_used = false;
     bool elastic_landing_used = false;
 
@@ -757,9 +888,26 @@ class Nodelet : public nodelet::Nodelet {
           }
         }
       }
+      else if (planner_mode_ == "elastic") {
+        // ========================================================
+        // 原 Elastic A* 主规划器
+        // ========================================================
+        elastic_tracking_used = true;
+
+        generate_new_traj_success =
+            generate_elastic_tracking_trajectory(
+                iniState,
+                target_v,
+                target_predcit,
+                traj);
+
+        if (!generate_new_traj_success) {
+          ROS_WARN("[ELASTIC MODE] planning failed.");
+        }
+      }
       else {
         // ========================================================
-        // 1. Kino 主规划器
+        // Kino 主规划器
         // ========================================================
         std::string kino_fail_reason;
 
@@ -775,9 +923,9 @@ class Nodelet : public nodelet::Nodelet {
         if (kino_primary_used) {
           generate_new_traj_success = true;
         }
-        else {
+        else if (planner_mode_ == "kino_fallback") {
           // ======================================================
-          // 2. Kino 失败 -> 原 Elastic Tracker fallback
+          // Kino 失败 -> 原 Elastic Tracker fallback
           // ======================================================
           ROS_WARN_STREAM(
               "[KINO PRIMARY] FAILED"
@@ -787,112 +935,23 @@ class Nodelet : public nodelet::Nodelet {
 
           elastic_fallback_used = true;
 
-          std::vector<Eigen::Vector3d> path;
-          std::vector<Eigen::Vector3d> way_pts;
-
           generate_new_traj_success =
-              envPtr_->findVisiblePath(
-                  p_start,
+              generate_elastic_tracking_trajectory(
+                  iniState,
+                  target_v,
                   target_predcit,
-                  way_pts,
-                  path);
+                  traj);
+        }
+        else {
+          // planner_mode = "kino"
+          // 双机对比时禁止 fallback，确保 drone1 始终只使用 Kino。
+          generate_new_traj_success = false;
 
-          if (generate_new_traj_success) {
-            if (target_predcit.size() < 2 ||
-                way_pts.size() < 2) {
-              generate_new_traj_success = false;
-            }
-          }
-
-          if (generate_new_traj_success) {
-            visPtr_->visualize_path(
-                path,
-                "astar");
-
-            // 和原 Elastic Tracker 完全相同：
-            // 删除最后一个 prediction / waypoint 后生成 visibility region。
-            target_predcit.pop_back();
-            way_pts.pop_back();
-
-            std::vector<Eigen::Vector3d> visible_ps;
-            std::vector<double> thetas;
-
-            envPtr_->generate_visible_regions(
-                target_predcit,
-                way_pts,
-                visible_ps,
-                thetas);
-
-            visPtr_->visualize_pointcloud(
-                visible_ps,
-                "visible_ps");
-
-            visPtr_->visualize_fan_shape_meshes(
-                target_predcit,
-                visible_ps,
-                thetas,
-                "visible_region");
-
-            visPtr_->visualize_pointcloud(
-                way_pts,
-                "way_pts");
-
-            // 原 Elastic 的第二层几何连接。
-            // 如果直线不可行，pts2path() 内部仍可能调用 short_astar()。
-            way_pts.insert(
-                way_pts.begin(),
-                p_start);
-
-            envPtr_->pts2path(
-                way_pts,
-                path);
-
-            if (path.size() < 2) {
-              generate_new_traj_success = false;
-            }
-
-            if (generate_new_traj_success) {
-              std::vector<Eigen::MatrixXd> hPolys;
-              std::vector<
-                  std::pair<Eigen::Vector3d, Eigen::Vector3d>>
-                  keyPts;
-
-              envPtr_->generateSFC(
-                  path,
-                  2.0,
-                  hPolys,
-                  keyPts);
-
-              if (hPolys.empty()) {
-                generate_new_traj_success = false;
-              }
-              else {
-                envPtr_->visCorridor(
-                    hPolys);
-
-                visPtr_->visualize_pairline(
-                    keyPts,
-                    "keyPts");
-
-                Eigen::MatrixXd finState;
-                finState.setZero(3, 3);
-                finState.col(0) =
-                    path.back();
-                finState.col(1) =
-                    target_v;
-
-                generate_new_traj_success =
-                    trajOptPtr_->generate_traj(
-                        iniState,
-                        finState,
-                        target_predcit,
-                        visible_ps,
-                        thetas,
-                        hPolys,
-                        traj);
-              }
-            }
-          }
+          ROS_WARN_STREAM(
+              "[KINO MODE] FAILED"
+              << "\nreason: "
+              << kino_fail_reason
+              << "\nNo Elastic fallback in pure Kino comparison mode.");
         }
       }
     }
@@ -915,7 +974,14 @@ class Nodelet : public nodelet::Nodelet {
     if (valid) {
       force_hover_ = false;
       if (kino_primary_used) {
-        ROS_WARN("[KINO PRIMARY] REPLAN SUCCESS - drone executes Kino trajectory");
+        if (planner_mode_ == "kino") {
+          ROS_WARN("[KINO MODE] REPLAN SUCCESS - drone executes Kino trajectory");
+        } else {
+          ROS_WARN("[KINO PRIMARY] REPLAN SUCCESS - drone executes Kino trajectory");
+        }
+      }
+      else if (elastic_tracking_used) {
+        ROS_WARN("[ELASTIC MODE] REPLAN SUCCESS - drone executes original Elastic trajectory");
       }
       else if (elastic_fallback_used) {
         ROS_WARN("[ELASTIC FALLBACK] REPLAN SUCCESS - drone executes fallback trajectory");
@@ -946,7 +1012,7 @@ class Nodelet : public nodelet::Nodelet {
       replanStateMsg_.state = 1;
       replanState_pub_.publish(replanStateMsg_);
       return;
-    } else if (validcheck(traj_poly_, replan_stamp_)) {
+    } else if (!validcheck(traj_poly_, replan_stamp_)) {
       force_hover_ = true;
       ROS_FATAL("[planner] EMERGENCY STOP!!!");
       replanStateMsg_.state = 2;
@@ -1284,6 +1350,24 @@ class Nodelet : public nodelet::Nodelet {
     nh.getParam("tolerance_d", tolerance_d_);
     nh.getParam("debug", debug_);
     nh.getParam("fake", fake_);
+    nh.param<std::string>(
+        "planner_mode",
+        planner_mode_,
+        "kino_fallback");
+
+    if (planner_mode_ != "elastic" &&
+        planner_mode_ != "kino" &&
+        planner_mode_ != "kino_fallback") {
+      ROS_WARN_STREAM(
+          "Unknown planner_mode: "
+          << planner_mode_
+          << ", fallback to kino_fallback.");
+      planner_mode_ = "kino_fallback";
+    }
+
+    ROS_WARN_STREAM(
+        "[planning] planner_mode = "
+        << planner_mode_);
 
     gridmapPtr_ = std::make_shared<mapping::OccGridMap>();
     kinoAstarPtr_ = std::make_shared<fast_planner::KinodynamicAstar>();
